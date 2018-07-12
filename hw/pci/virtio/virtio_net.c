@@ -29,8 +29,10 @@
 #include <sys/cdefs.h>
 #include <sys/param.h>
 #include <sys/select.h>
+#include <sys/poll.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
+#include <sys/eventfd.h>
 #include <net/ethernet.h>
 #ifndef NETMAP_WITH_LIBS
 #define NETMAP_WITH_LIBS
@@ -56,6 +58,8 @@
 #include "netmap_user.h"
 #include <net/if.h>
 #include <linux/if_tun.h>
+
+#include "vhost_kernel.h"
 
 #define VIRTIO_NET_RINGSZ	1024
 #define VIRTIO_NET_MAXSEGS	256
@@ -123,13 +127,18 @@ struct virtio_net_rxhdr {
 /*
  * Debug printf
  */
-static int virtio_net_debug;
+static int virtio_net_debug = 1;
 #define DPRINTF(params) do { if (virtio_net_debug) printf params; } while (0)
 #define WPRINTF(params) (printf params)
 
 /*
  * Per-device struct
  */
+
+struct vhost_net {
+	struct vhost_dev vhost_dev;
+};
+
 struct virtio_net {
 	struct virtio_base base;
 	struct virtio_vq_info queues[VIRTIO_NET_MAXQ - 1];
@@ -153,6 +162,7 @@ struct virtio_net {
 	int		rx_vhdrlen;
 	int		rx_merge;	/* merged rx bufs in use */
 	pthread_t	tx_tid;
+	pthread_t	rx_callfd_tid;
 	pthread_mutex_t	tx_mtx;
 	pthread_cond_t	tx_cond;
 	int		tx_in_progress;
@@ -160,6 +170,11 @@ struct virtio_net {
 	void (*virtio_net_rx)(struct virtio_net *net);
 	void (*virtio_net_tx)(struct virtio_net *net, struct iovec *iov,
 			     int iovcnt, int len);
+
+	int vhost_ready;
+	struct vhost_net *vhost_n;
+	int vhostfd;
+
 };
 
 static void virtio_net_reset(void *);
@@ -168,6 +183,11 @@ static void virtio_net_tx_stop(struct virtio_net *);
 static int virtio_net_cfgread(void *, int, int, uint32_t *);
 static int virtio_net_cfgwrite(void *, int, int, uint32_t);
 static void virtio_net_neg_features(void *, uint64_t);
+static void virtio_net_set_status(void *, uint64_t);
+
+static struct vhost_net *vhost_net_init(struct virtio_base *base, int vhostfd, int tapfd);
+static int vhost_net_start(struct vhost_net *vhost_n, int num_of_queues);
+static int vhost_net_stop(struct virtio_net *net, int num_of_queues);
 
 static struct virtio_ops virtio_net_ops = {
 	"vtnet",			/* our name */
@@ -178,7 +198,7 @@ static struct virtio_ops virtio_net_ops = {
 	virtio_net_cfgread,		/* read PCI config */
 	virtio_net_cfgwrite,		/* write PCI config */
 	virtio_net_neg_features,	/* apply negotiated features */
-	NULL,				/* called on guest set status */
+	virtio_net_set_status,		/* called on guest set status */
 	VIRTIO_NET_S_HOSTCAPS,		/* our capabilities */
 };
 
@@ -625,11 +645,13 @@ virtio_net_rx_callback(int fd, enum ev_type type, void *param)
 {
 	struct virtio_net *net = param;
 
-	pthread_mutex_lock(&net->rx_mtx);
-	net->rx_in_progress = 1;
-	net->virtio_net_rx(net);
-	net->rx_in_progress = 0;
-	pthread_mutex_unlock(&net->rx_mtx);
+	if(net->vhost_ready == 0) {
+		pthread_mutex_lock(&net->rx_mtx);
+		net->rx_in_progress = 1;
+		net->virtio_net_rx(net);
+		net->rx_in_progress = 0;
+		pthread_mutex_unlock(&net->rx_mtx);
+	}
 
 }
 
@@ -688,11 +710,63 @@ virtio_net_ping_txq(void *vdev, struct virtio_vq_info *vq)
 		return;
 
 	/* Signal the tx thread for processing */
-	pthread_mutex_lock(&net->tx_mtx);
-	vq->used->flags |= VRING_USED_F_NO_NOTIFY;
-	if (net->tx_in_progress == 0)
-		pthread_cond_signal(&net->tx_cond);
-	pthread_mutex_unlock(&net->tx_mtx);
+	if (net->vhost_ready) {
+		uint64_t kick_val = 1;
+
+		/* TX kick. */
+		{
+#if 0
+			WPRINTF(("vq->avail->idx:%d \n\r", vq->avail->idx));
+			int idx = vq->avail->idx - 1;
+			volatile struct virtio_desc *desc = &vq->desc[ vq->avail->ring[idx % vq->qsize] ];
+			WPRINTF(("virtio_net_ping_txq:ring[idx]:%d, avail idx:%d\n\r",
+						vq->avail->ring[idx % vq->qsize], idx));
+			WPRINTF(("virtio_net:desc:addr:%lx, len:%x, flags:%x, next:%x\n\r",
+						desc->addr, desc->len, desc->flags, desc->next));
+			char *vb = paddr_guest2host(net->base.dev->vmctx, desc->addr, desc->len);
+
+			int i;
+			for(i = 0; i < desc->len; i++)
+				WPRINTF(("%x ", ((unsigned char *)vb)[i] ));
+			WPRINTF(("\n\r"));
+
+			if(desc->flags & VRING_DESC_F_INDIRECT) {
+				for(int iter = 0; iter < desc->len / 16; iter++) {
+					uint64_t vb1 = ((uint64_t *)vb)[iter*2];
+					uint32_t vb1_len = ((uint32_t *)vb)[iter * 4 + 2];
+					char *vb1_ha = paddr_guest2host(net->base.dev->vmctx, vb1, vb1_len);
+					WPRINTF(("vb1:%lx, vb1_ha:%p, len:%d \n\r", vb1, vb1_ha, vb1_len));
+					for(i = 0; i < vb1_len; i++)
+						WPRINTF(("%x ", ((unsigned char *)vb1_ha)[i] ));
+
+					WPRINTF(("\n\r"));
+				}
+			}
+#endif
+			int tx_kickfd = net->queues[VIRTIO_NET_TXQ].kick;
+			int tx_ret = write(tx_kickfd, &kick_val, sizeof(kick_val));
+			if(tx_ret < 0)
+				WPRINTF(("virtio_net_ping_txq:write error:%d, %d\n\r", tx_ret, errno));
+			fsync(tx_kickfd);
+
+		}
+
+		/* RX kick. */
+		{
+			int rx_kickfd = net->queues[VIRTIO_NET_RXQ].kick;
+			int rx_ret = write(rx_kickfd, &kick_val, sizeof(kick_val));
+			fsync(rx_kickfd);
+			if(rx_ret < 0)
+				WPRINTF(("virtio_net_ping_txq:write error:%d, %d\n\r", rx_ret, errno));
+		}
+
+	} else {
+		pthread_mutex_lock(&net->tx_mtx);
+		vq->used->flags |= VRING_USED_F_NO_NOTIFY;
+		if (net->tx_in_progress == 0)
+			pthread_cond_signal(&net->tx_cond);
+		pthread_mutex_unlock(&net->tx_mtx);
+	}
 }
 
 /*
@@ -801,7 +875,8 @@ virtio_net_tap_open(char *devname)
 	}
 
 	memset(&ifr, 0, sizeof(ifr));
-	ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+	/* socket is provided by usermode, IFF_UP flag is required here. */
+	ifr.ifr_flags = IFF_TAP | IFF_NO_PI | IFF_UP;
 
 	if (*devname)
 		strncpy(ifr.ifr_name, devname, IFNAMSIZ);
@@ -859,6 +934,20 @@ virtio_net_tap_setup(struct virtio_net *net, char *devname)
 		WPRINTF(("Could not register event\n"));
 		close(net->tapfd);
 		net->tapfd = -1;
+	}
+
+	int vhostfd = open("/dev/vhost-net", O_RDWR);
+	if (vhostfd < 0) {
+		WPRINTF(("open of vhost-net failed:%d\n", vhostfd));
+		return;
+	}
+	net->vhostfd = vhostfd;
+
+	net->vhost_n = vhost_net_init(&net->base, net->vhostfd, net->tapfd);
+
+	if(net->vhost_n == NULL) {
+		WPRINTF(("vhost-net initialize failed\n"));
+		return;
 	}
 }
 
@@ -1028,6 +1117,8 @@ virtio_net_init(struct vmctx *ctx, struct pci_vdev *dev, char *opts)
 		 dev->func);
 	pthread_setname_np(net->tx_tid, tname);
 
+	net->vhost_ready = 0;
+
 	return 0;
 }
 
@@ -1075,6 +1166,131 @@ virtio_net_neg_features(void *vdev, uint64_t negotiated_features)
 		/* non-merge rx header is 2 bytes shorter */
 		net->rx_vhdrlen -= 2;
 	}
+}
+
+struct vhost_net *vhost_net_init(struct virtio_base *base, int vhostfd, int tapfd)
+{
+	WPRINTF(("vhost_net_init: base: %p, vhostfd:%d, tapfd:%d \n\r", base, vhostfd, tapfd));
+	struct vhost_net *vhost_n;
+	vhost_n = calloc(1, sizeof(struct vhost_net));
+	int ret = 0;
+	if (!vhost_n) {
+		WPRINTF(("vhost_net: calloc returns NULL\n"));
+		return NULL;
+	}
+
+	/*FIXME: move below code into vhost_dev_init. */
+	vhost_n->vhost_dev.num_of_queues = 2;
+	vhost_n->vhost_dev.backend_fd = tapfd;
+
+	ret = vhost_dev_init(&vhost_n->vhost_dev, base, vhostfd);
+
+	assert(ret == 0);
+
+	return vhost_n;
+}
+
+int vhost_net_start(struct vhost_net *vhost_n, int num_of_queues)
+{
+	WPRINTF(("vhost_net_start: vhost_dev: %p\n\r", &vhost_n->vhost_dev));
+	return vhost_dev_start(&vhost_n->vhost_dev, vhost_n->vhost_dev.base);
+}
+
+int vhost_net_stop(struct virtio_net *net, int num_of_queues)
+{
+	return 0;
+}
+
+int vhost_net_rx_callfd_check(int32_t callfd)
+{
+	int ret = 0;
+	char buf[128] = {0};
+	struct pollfd fds[1] = {0};
+	fds[0].fd = callfd;
+	fds[0].events = POLLIN;
+	ret = poll(fds, sizeof(fds)/sizeof(fds[0]), -1);
+
+	if(-1 == ret) {
+		WPRINTF(("poll error!\n\r"));
+	}
+
+	if(fds[0].revents & POLLIN ){
+		ret = read(callfd, buf, sizeof(buf));
+		if(-1 == ret) {
+			WPRINTF(("read call fd error!\n\r"));
+		}
+		/*printf("buf:%d, ret:%d\n\r", buf[0], ret);*/
+		if(buf[0] == 1)
+			return 1;
+		else
+			return -1;
+
+	}
+
+	return ret;
+}
+
+/*
+ * Thread which will handle callfd.
+ */
+static void *
+vhost_net_rx_callfd_thread(void *param)
+{
+	struct virtio_net *net = param;
+	struct virtio_vq_info *vq;
+	int ret = 0;
+
+	vq = &net->queues[VIRTIO_NET_RXQ];
+
+	for (;;) {
+		ret = vhost_net_rx_callfd_check(vq->call);
+		if (ret != 1 )
+			continue;
+
+		/*WPRINTF(("vq->used->idx:%d, tlen:%d, msi:%d\n\r",*/
+					/*vq->used->idx, vq->used->ring[vq->used->idx].tlen, vq->msix_idx));*/
+		pci_generate_msix(net->base.dev, vq->msix_idx);
+	}
+
+	return NULL;
+}
+
+static void
+vhost_net_set_status(void *vdev, uint64_t status)
+{
+	int ret;
+	struct virtio_net *net = vdev;
+	DPRINTF(("vtnet: virito_net_vhost_status:vhost_ready %d\n\r", net->vhost_ready));
+	/*FIXME: need check vq status instead of check address.*/
+	if (!net->vhost_ready && net->queues[0].desc != NULL && net->base.queues[0].desc != NULL) {
+		printf("status: desc0:%p\n\r", net->queues[0].desc);
+		printf("status: desc1:%p\n\r", net->queues[1].desc);
+		ret = vhost_net_start(net->vhost_n, VIRTIO_NET_MAXQ - 1);
+		assert(ret >= 0);
+
+		/*FIXME: pass the kickfd and callfd to VHM here before vhost is ready. then the
+		 * dm tx kick and rx call thread can be removed. */
+
+
+		/* start RX callfd thread. this will cause performance issue when booting UOS, need switch to vhm
+		 * polling mode. */
+		if(1)
+			pthread_create(&net->rx_callfd_tid, NULL, vhost_net_rx_callfd_thread, (void *)net);
+
+		net->vhost_ready = 1;
+	} else {
+		ret = vhost_net_stop(net, VIRTIO_NET_MAXQ - 1);
+		assert(ret >= 0);
+		net->vhost_ready = 0;
+	}
+
+}
+
+static
+void virtio_net_set_status(void *vdev, uint64_t status)
+{
+	/* FIXME: check whether vhost=on option is exist here. */
+	vhost_net_set_status(vdev, status);
 }
 
 static void

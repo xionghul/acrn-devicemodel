@@ -463,6 +463,9 @@ struct virtio_vq_info {
 	volatile struct vring_used *used;
 				/**< the "used" ring */
 
+	/*FIXME: remove me after switch to vhost kernel notify. */
+	int32_t call;
+	int32_t kick;
 };
 
 /* as noted above, these are sort of backwards, name-wise */
